@@ -3,8 +3,15 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
+import time
 import traffic_generator
-from datetime import datetime
+from datetime import datetime, timedelta
+from forecast import (
+    LinearForecaster,
+    recommend_replicas,
+    rmse,
+    rolling_forecast,
+)
 
 # --------------------------------------------------
 # PAGE CONFIGURATION
@@ -41,6 +48,34 @@ def get_metric(query):
     return None
 
 
+def get_range(query, minutes=30, step=15):
+    """History of one query as a DataFrame with columns time and value."""
+    end = time.time()
+    try:
+        response = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query_range",
+            params={
+                "query": query,
+                "start": end - minutes * 60,
+                "end": end,
+                "step": step,
+            },
+            timeout=5
+        )
+        response.raise_for_status()
+        results = response.json()["data"]["result"]
+        if not results:
+            return None
+        rows = [
+            (datetime.fromtimestamp(float(t)), float(v))
+            for t, v in results[0]["values"]
+            if v not in ("NaN", "+Inf", "-Inf")
+        ]
+        return pd.DataFrame(rows, columns=["time", "value"])
+    except (requests.RequestException, ValueError, KeyError, IndexError):
+        return None
+
+
 def format_value(value, suffix="", multiplier=1):
     if value is None:
         return "No data"
@@ -68,8 +103,8 @@ st.sidebar.title("⚙️ Control Center")
 st.sidebar.subheader("Traffic Generator")
 
 traffic_level = st.sidebar.selectbox(
-    "Traffic intensity",
-    ["Low", "Medium", "High"]
+    "Traffic scenario",
+    list(traffic_generator.SCENARIOS)
 )
 
 start_col, stop_col = st.sidebar.columns(2)
@@ -84,6 +119,10 @@ with stop_col:
 
 if traffic_generator.running:
     st.sidebar.success("Traffic generator is running")
+    st.sidebar.caption(
+        f"{traffic_generator.current_scenario}: target "
+        f"{traffic_generator.current_target_rps:.1f} req/s"
+    )
 else:
     st.sidebar.warning("Traffic generator is stopped")
 
@@ -262,12 +301,8 @@ st.subheader("🧠 Baseline Scaling Recommendation")
 if request_rate is not None and min_replicas < max_replicas:
     estimated_demand = request_rate * 60
 
-    recommended = max(
-        min_replicas,
-        min(
-            int((estimated_demand / requests_per_replica) + 0.999),
-            max_replicas
-        )
+    recommended = recommend_replicas(
+        request_rate, min_replicas, max_replicas, requests_per_replica
     )
 
     result1, result2, result3 = st.columns(3)
@@ -299,6 +334,95 @@ else:
     st.warning(
         "Scaling recommendation unavailable. Check metrics and replica limits."
     )
+
+# --------------------------------------------------
+# PREDICTIVE RECOMMENDATION (LINEAR FORECAST)
+# --------------------------------------------------
+
+STEP_SECONDS = 15
+LOOKBACK_STEPS = 12      # 3 minutes of history
+HORIZON_STEPS = 4        # forecast 1 minute ahead
+HISTORY_MINUTES = 30
+
+st.divider()
+st.subheader("📈 Predictive Recommendation (linear forecast)")
+
+range_df = get_range(
+    "sum(rate(flask_http_request_duration_seconds_count[1m]))",
+    minutes=HISTORY_MINUTES,
+    step=STEP_SECONDS
+)
+
+if range_df is None or len(range_df) < 40:
+    st.warning(
+        "Not enough history yet. Run the traffic generator for about "
+        "10 minutes (Wave, Spike or Ramp shows forecasting best), "
+        "then refresh."
+    )
+elif min_replicas >= max_replicas:
+    st.warning("Fix the replica limits in the sidebar first.")
+else:
+    values = range_df["value"].to_numpy()
+    try:
+        forecaster = LinearForecaster(LOOKBACK_STEPS, HORIZON_STEPS).fit(values)
+    except ValueError as error:
+        st.warning(f"Cannot fit the forecast yet: {error}")
+    else:
+        predicted_rate = forecaster.predict_next(values)
+        replicas_now = recommend_replicas(
+            values[-1], min_replicas, max_replicas, requests_per_replica
+        )
+        replicas_forecast = recommend_replicas(
+            predicted_rate, min_replicas, max_replicas, requests_per_replica
+        )
+
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Current request rate", f"{values[-1]:.2f} req/s")
+        f2.metric("Forecast in 1 min", f"{predicted_rate:.2f} req/s")
+        f3.metric("Replicas for current load", str(replicas_now))
+        f4.metric("Replicas for forecast", str(replicas_forecast))
+
+        idx, predicted, actual = rolling_forecast(
+            values, LOOKBACK_STEPS, HORIZON_STEPS, min_train=40, last=40
+        )
+        if len(idx) > 5:
+            naive = values[idx - HORIZON_STEPS]
+            fig_forecast = go.Figure()
+            fig_forecast.add_trace(go.Scatter(
+                x=range_df["time"], y=values,
+                mode="lines", name="Actual"
+            ))
+            fig_forecast.add_trace(go.Scatter(
+                x=range_df["time"].iloc[idx], y=predicted,
+                mode="lines", name="Forecast made 1 min earlier"
+            ))
+            fig_forecast.add_trace(go.Scatter(
+                x=[range_df["time"].iloc[-1]
+                   + timedelta(seconds=STEP_SECONDS * HORIZON_STEPS)],
+                y=[predicted_rate],
+                mode="markers", name="Next forecast",
+                marker=dict(size=11, symbol="diamond")
+            ))
+            fig_forecast.update_layout(
+                title="Actual vs forecast request rate",
+                xaxis_title="Time",
+                yaxis_title="Requests per second",
+                template="plotly_dark"
+            )
+            st.plotly_chart(fig_forecast, use_container_width=True)
+            st.caption(
+                f"Error over the last {len(idx)} forecasts (each made using "
+                f"only data available at the time): linear model "
+                f"{rmse(actual, predicted):.3f} req/s, naive last-value "
+                f"{rmse(actual, naive):.3f} req/s."
+            )
+
+        st.caption(
+            "One linear model refitted on the last "
+            f"{HISTORY_MINUTES} minutes. It helps only when load follows a "
+            "pattern. This is a recommendation; no Kubernetes scaling "
+            "action is performed yet."
+        )
 
 # --------------------------------------------------
 # PROJECT STATUS
